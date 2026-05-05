@@ -48,7 +48,54 @@ def _run(
     run_env = os.environ.copy()
     if env:
         run_env.update(env)
-    subprocess.run(cmd, cwd=cwd or REPO_ROOT, env=run_env, check=True)
+
+    # Stream output in real-time instead of waiting for completion
+    print(f"\n[build_common] Running: {' '.join(str(c) for c in cmd)}")
+    print("[build_common] Output:")
+    print("-" * 60)
+
+    process = subprocess.Popen(
+        cmd,
+        cwd=cwd or REPO_ROOT,
+        env=run_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1  # Line buffered
+    )
+
+    # Stream stdout and stderr in real-time
+    import sys
+    import threading
+
+    def stream_output(pipe, prefix):
+        """Stream output from a pipe in real-time."""
+        for line in iter(pipe.readline, ''):
+            if line.strip():
+                print(f"{prefix}{line}", end='')
+                sys.stdout.flush()
+
+    # Create threads to stream both stdout and stderr
+    stdout_thread = threading.Thread(target=stream_output, args=(process.stdout, "[stdout] "))
+    stderr_thread = threading.Thread(target=stream_output, args=(process.stderr, "[stderr] "))
+
+    stdout_thread.daemon = True
+    stderr_thread.daemon = True
+
+    stdout_thread.start()
+    stderr_thread.start()
+
+    # Wait for process to complete
+    returncode = process.wait()
+
+    # Wait for threads to finish
+    stdout_thread.join()
+    stderr_thread.join()
+
+    print("-" * 60)
+
+    if returncode != 0:
+        raise subprocess.CalledProcessError(returncode, cmd)
 
 
 def _pick_wheel(wheel_arg: str | None) -> Path:
@@ -132,25 +179,26 @@ def main() -> int:
                 "-y",
             ],
         )
-        _run(
-            [
-                conda,
-                "run",
-                "-n",
-                env_name,
-                "python",
-                "-m",
-                "pip",
-                "install",
-                "--upgrade",
-                "pip",
-            ],
-        )
+        # Prevent damage condameta
+        # _run(
+        #     [
+        #         conda,
+        #         "run",
+        #         "-n",
+        #         env_name,
+        #         "python",
+        #         "-m",
+        #         "pip",
+        #         "install",
+        #         "--upgrade",
+        #         "pip",
+        #     ],
+        # )
 
         # Install qwenpaw with all dependencies
         # Scope CMAKE_ARGS to this specific command to avoid affecting other
         # CMake-based packages. Only set if we need to compile from source.
-        install_env = {}
+        install_env = { "PYTHONNOUSERSITE": "1"}
 
         _run(
             [
@@ -161,11 +209,35 @@ def main() -> int:
                 "python",
                 "-m",
                 "pip",
-                "install",
+                "install", 
+                "--no-user",
+                "--force-reinstall",
                 f"qwenpaw[full] @ {wheel_uri}",
             ],
             env=install_env,
         )
+        
+        # Restore conda-managed pip, setuptools, and packaging to fix conda-pack conflicts
+        # This overwrites any pip-modified files back to conda versions
+        # Prevents "Files managed by conda were found to have been deleted/overwritten" error
+        print("Restoring conda-managed pip, setuptools, and packaging...")
+        _run(
+            [
+                conda,
+                "run",
+                "-n",
+                env_name,
+                "conda",
+                "install",
+                "pip",
+                "setuptools",
+                "packaging",
+                "--force-reinstall",
+                "-y",
+                "--quiet",
+            ],
+        )
+        
         print("Verifying certifi is installed (required for SSL)...")
         _run(
             [
@@ -201,6 +273,8 @@ def main() -> int:
                     str(wheels_cache),
                 ],
             )
+        # Version 0.8.0+ fixes strict file conflict checks that cause packaging failures
+        print("Installing conda-pack >= 0.8.1 via pip...")
         _run(
             [
                 conda,
@@ -210,7 +284,7 @@ def main() -> int:
                 conda,
                 "install",
                 "-y",
-                "conda-pack",
+                "conda-pack>=0.8.1",
             ],
         )
         if out_path.exists():
